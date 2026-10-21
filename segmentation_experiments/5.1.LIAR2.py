@@ -30,6 +30,7 @@ USE_STATEMENT_BRANCH = os.environ.get('LIAR2_USE_STATEMENT_BRANCH', '1') == '1'
 LABEL_SMOOTHING = float(os.environ.get('LIAR2_LABEL_SMOOTHING', '0'))
 ORDINAL_LOSS_WEIGHT = float(os.environ.get('LIAR2_ORDINAL_LOSS_WEIGHT', '0'))
 ENSEMBLE_SIZE = max(1, int(os.environ.get('LIAR2_ENSEMBLE_SIZE', '1')))
+USE_REGULARIZED_TRAINING = os.environ.get('LIAR2_REGULARIZED_TRAINING', '0') == '1'
 ENSEMBLE_SEED = 42
 JUSTIFICATION_MODEL_NAME = 'distilbert-base-uncased'
 JUSTIFICATION_MAX_LENGTH = 192
@@ -44,6 +45,9 @@ elif USE_PRETRAINED_JUSTIFICATION:
     model_save = 'LIAR2_DistilBERT_justification.pt'
 else:
     model_save = 'LIAR2.pt'
+if USE_REGULARIZED_TRAINING:
+    regularized_run_tag = os.environ.get('LIAR2_REGULARIZED_TAG', 'regularized')
+    model_save = model_save.replace('.pt', f'_{regularized_run_tag}.pt')
 if ENSEMBLE_SIZE > 1:
     model_save = model_save.replace('.pt', '_ensemble.pt')
 model_name = 'LIAR2'
@@ -52,6 +56,8 @@ batch_size = 16 if USE_PRETRAINED_JUSTIFICATION else 32
 learning_rate = 3e-4 if USE_PRETRAINED_JUSTIFICATION else 1e-3
 encoder_learning_rate = 2e-5
 early_stopping_patience = 3
+regularized_weight_decay = float(os.environ.get('LIAR2_WEIGHT_DECAY', '1e-4'))
+regularized_early_stopping_patience = 2
 num_classes = 6
 padding_idx = 0
 metadata_each_dim = 10
@@ -298,7 +304,8 @@ class CNNBiLSTM(nn.Module):
                            hidden_dim, 
                            num_layers=n_layers, 
                            bidirectional=bidirectional, 
-                           dropout=dropout)
+                           dropout=dropout if n_layers > 1 else 0.0,
+                           batch_first=True)
         self.fc = nn.Linear(hidden_dim * 2, output_dim)
         self.dropout = nn.Dropout(dropout)
     
@@ -313,19 +320,16 @@ class CNNBiLSTM(nn.Module):
         conved = F.relu(self.conv(embedded))
         #conved = [batch size, n_filters, metadata dim - filter_sizes[n] + 1]
 
-        conved = torch.reshape(conved, (metadata.size(0), 32))
+        conved = conved.squeeze(-1).unsqueeze(1)
 
         outputs, (hidden, cell) = self.rnn(conved)
         #outputs = [metadata dim - filter_sizes[n] + 1, batch size, hid dim * num directions]
         #hidden = [num layers * num directions, batch size, hid dim]
         #cell = [num layers * num directions, batch size, hid dim]
 
-        #concat the final forward (hidden[-2,:,:]) and backward (hidden[-1,:,:]) hidden layers
-        #and apply dropout
-        # hidden = self.dropout(torch.cat((hidden[-1,:], hidden[0,:]), dim = -1))
-        #hidden = [batch size, hid dim * num directions]
-
-        return self.fc(outputs)
+        # Concatenate final forward and backward states for each independent sample.
+        pooled = torch.cat((hidden[-2], hidden[-1]), dim=-1)
+        return self.fc(self.dropout(pooled))
 
 
 class DistilBertJustification(nn.Module):
@@ -441,7 +445,12 @@ def build_model_and_optimizer(seed):
             weight_decay=0.01
         )
     else:
-        optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+        if USE_REGULARIZED_TRAINING:
+            optimizer = torch.optim.AdamW(
+                model.parameters(), lr=learning_rate, weight_decay=regularized_weight_decay
+            )
+        else:
+            optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     return model, optimizer
 
 
@@ -543,7 +552,7 @@ def train(num_epochs, model, train_loader, val_loader, optimizer, criterion, mod
         Val_macro_f1.append(val_macro_f1)
         Val_micro_f1.append(val_micro_f1)
 
-        if USE_PRETRAINED_JUSTIFICATION:
+        if USE_PRETRAINED_JUSTIFICATION or USE_REGULARIZED_TRAINING:
             is_best = val_accuracy > best_valid_accuracy
         else:
             is_best = val_loss < best_valid_loss
@@ -554,7 +563,7 @@ def train(num_epochs, model, train_loader, val_loader, optimizer, criterion, mod
             epochs_without_improvement = 0
             torch.save(model.state_dict(), model_save)
             print(f'***** Best Result Updated at Epoch {epoch_trained}, Val Acc: {val_accuracy:.4f}, Val Loss: {val_loss:.4f} *****')
-        elif USE_PRETRAINED_JUSTIFICATION:
+        elif USE_PRETRAINED_JUSTIFICATION or USE_REGULARIZED_TRAINING:
             epochs_without_improvement += 1
 
         # Print the losses and accuracy
@@ -563,8 +572,9 @@ def train(num_epochs, model, train_loader, val_loader, optimizer, criterion, mod
 
         print(f"Epoch [{epoch+1}/{num_epochs}], Time: {epoch_time:.2f}s, Train Loss: {train_loss:.4f}, Train Acc: {train_accuracy:.4f}, Train F1 Macro: {train_macro_f1:.4f}, Train F1 Micro: {train_micro_f1:.4f}, Val Loss: {val_loss:.4f}, Val Acc: {val_accuracy:.4f}, Val F1 Macro: {val_macro_f1:.4f}, Val F1 Micro: {val_micro_f1:.4f}")
 
-        if USE_PRETRAINED_JUSTIFICATION and epochs_without_improvement >= early_stopping_patience:
-            print(f"Early stopping after {early_stopping_patience} epochs without validation-accuracy improvement.")
+        patience = regularized_early_stopping_patience if USE_REGULARIZED_TRAINING else early_stopping_patience
+        if (USE_PRETRAINED_JUSTIFICATION or USE_REGULARIZED_TRAINING) and epochs_without_improvement >= patience:
+            print(f"Early stopping after {patience} epochs without validation-accuracy improvement.")
             break
 
     end_time = time.time()
